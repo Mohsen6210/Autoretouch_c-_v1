@@ -1,0 +1,94 @@
+name: Build AutoRetouchCpp (Windows x64)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+    paths:
+      - 'src/**'
+      - 'CMakeLists.txt'
+      - '.github/workflows/build-windows.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install Qt 6 (MSVC 2022 x64)
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.8.3'
+          host: windows
+          target: desktop
+          arch: win64_msvc2022_64
+          cache: true
+
+      - name: Install OpenCV through vcpkg
+        shell: pwsh
+        run: |
+          vcpkg install opencv4:x64-windows
+          if ($LASTEXITCODE -ne 0) { throw 'vcpkg could not install OpenCV.' }
+
+      - name: Configure CMake
+        shell: pwsh
+        run: |
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64 `
+            "-DCMAKE_TOOLCHAIN_FILE=$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" `
+            -DVCPKG_TARGET_TRIPLET=x64-windows
+          if ($LASTEXITCODE -ne 0) { throw 'CMake configuration failed.' }
+
+      - name: Build Release
+        shell: pwsh
+        run: |
+          cmake --build build --config Release --parallel
+          if ($LASTEXITCODE -ne 0) { throw 'C++ build failed.' }
+
+      - name: Stage executable and runtime dependencies
+        shell: pwsh
+        run: |
+          $exe = Join-Path $PWD 'build/Release/AutoRetouchCpp.exe'
+          if (-not (Test-Path $exe)) { throw "Expected executable not found: $exe" }
+
+          $stage = Join-Path $PWD 'dist/AutoRetouchCpp'
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item $exe $stage
+
+          # Bundle Qt runtime plugins and compiler runtime where needed.
+          windeployqt --release --compiler-runtime --no-translations (Join-Path $stage 'AutoRetouchCpp.exe')
+          if ($LASTEXITCODE -ne 0) { throw 'windeployqt failed.' }
+
+          # vcpkg's x64-windows triplet uses dynamic libraries. Copy its runtime DLLs.
+          $opencvBin = Join-Path $env:VCPKG_INSTALLATION_ROOT 'installed/x64-windows/bin'
+          $dlls = Get-ChildItem -Path $opencvBin -Filter '*.dll' -File
+          if (-not $dlls) { throw "No runtime DLLs found in $opencvBin" }
+          Copy-Item $dlls.FullName $stage -Force
+
+          # Include the OpenCV Haar cascade used by the current C++ fallback detector.
+          $cascade = Join-Path $stage 'haarcascade_frontalface_default.xml'
+          Invoke-WebRequest `
+            -Uri 'https://raw.githubusercontent.com/opencv/opencv/4.x/data/haarcascades/haarcascade_frontalface_default.xml' `
+            -OutFile $cascade
+          if (-not (Test-Path $cascade) -or (Get-Item $cascade).Length -lt 100000) {
+            throw 'OpenCV Haar cascade download failed or returned an invalid file.'
+          }
+
+          @'
+          AutoRetouchCpp Windows x64 build
+          Built by GitHub Actions. Keep all files in this folder together.
+          The application uses Qt 6, OpenCV DLLs, and haarcascade_frontalface_default.xml.
+          '@ | Set-Content -Encoding UTF8 (Join-Path $stage 'README-runtime.txt')
+
+      - name: Upload Windows package
+        uses: actions/upload-artifact@v4
+        with:
+          name: AutoRetouchCpp-Windows-x64
+          path: dist/AutoRetouchCpp/**
+          if-no-files-found: error
+          retention-days: 14
